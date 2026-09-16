@@ -5,7 +5,12 @@ on:
     # Expediente de 9h (8h-17h Brasília), 2 disparos por dia.
     - cron: '0 11 * * 1-5'   # 08:00 em Brasília
     - cron: '0 17 * * 1-5'   # 14:00 em Brasília
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      ignorar_horario:
+        description: 'Rodar mesmo fora da janela 8h-17h (só para testes manuais)'
+        type: boolean
+        default: false
 
 jobs:
   captar-processos:
@@ -28,17 +33,24 @@ jobs:
           pip install -r requirements.txt
           playwright install --with-deps chromium
 
-      - name: Escrever credencial do Firebase
+      - name: Escrever credencial do Firebase (projeto de processos)
         env:
           FIREBASE_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_EPROC_JSON }}
         run: |
           echo "$FIREBASE_JSON" > firebase-service-account-eproc.json
 
-      - name: Rodar o bot dentro do Xvfb (loop contínuo até o timeout do job)
+      - name: Escrever credencial do Firebase (projeto botorion2 — status/heartbeat)
+        env:
+          BOTORION2_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_BOTORION2_JSON }}
+        run: |
+          echo "$BOTORION2_JSON" > firebase-service-account2.json
+
+      - name: Rodar o bot dentro do Xvfb (loop contínuo até 17h ou o timeout do job)
         env:
           EPROC_SP_USUARIO: ${{ secrets.EPROC_SP_USUARIO }}
           EPROC_SP_SENHA: ${{ secrets.EPROC_SP_SENHA }}
           EPROC_SP_TOTP_SECRET: ${{ secrets.EPROC_SP_TOTP_SECRET }}
+          IGNORAR_HORARIO: ${{ github.event.inputs.ignorar_horario }}
           PYTHONUNBUFFERED: "1"
         run: xvfb-run -a python bot_eproc_sp.py
 
