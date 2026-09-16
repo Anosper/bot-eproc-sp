@@ -12,6 +12,8 @@ import firebase_admin
 from firebase_admin import credentials
 from firebase_admin import firestore
 
+import status_bots
+
 
 # ============================================================
 # SUPORTE A "PULAR ESPERA" APERTANDO ENTER NO TERMINAL
@@ -104,12 +106,14 @@ load_dotenv()
 # funciona (TJRJ) roda assim, por trás do Xvfb no GitHub Actions —
 # alguns eproc detectam modo headless de verdade e bloqueiam a sessão
 # (ex: TJTO retorna 403 em headless). O workflow do GitHub Actions
-# deve instalar e usar Xvfb (xvfb-run -a python bot_eproc_todos.py).
+# deve instalar e usar Xvfb (xvfb-run -a python bot_eproc_sp.py).
 HEADLESS = False
 
 ARQUIVO_SESSAO_EPROC = "sessao_eproc_sp.json"
 INTERVALO_ENTRE_VARREDURAS = 30
 VALOR_MINIMO_CAUSA = float(os.getenv("VALOR_MINIMO_CAUSA_EPROC", "10000"))
+
+NOME_DO_GRUPO = "eprocsp"
 
 CLASSES_EPROC_PADRAO = [
     "Execução de Título Extrajudicial",
@@ -1599,7 +1603,11 @@ def processar_eproc_tribunal(sessao, tribunal):
         diagnosticar_tela(sessao.pagina, f"{nome}_erro_abrir_consulta")
         return False, "Não consegui abrir a tela de Consulta Processual"
 
-    print(f"[{nome}] Login + Consulta Processual OK — iniciando pesquisas.")
+    # Reporta "rodando" JÁ AQUI (login + Consulta Processual ok),
+    # antes de começar o loop de OAB x Classe — que pode levar vários
+    # minutos. Sem isso, o painel ficava com o status de um ciclo
+    # anterior até TODAS as combinações terminarem.
+    status_bots.atualizar_status(nome, NOME_DO_GRUPO, "rodando")
 
     pagina = sessao.pagina
     contexto = sessao.contexto
@@ -1611,6 +1619,11 @@ def processar_eproc_tribunal(sessao, tribunal):
         for indice_classe, classe_atual in enumerate(tribunal["classes"]):
             print()
             print(f"--- {nome} / {tipo_pesquisa} {valor_busca_atual} / {classe_atual} ---")
+            # Reafirma "rodando" a cada combinação — se travar numa
+            # específica, o "atualizadoEm" para de avançar mesmo com
+            # o heartbeat do grupo continuando (ajuda a diferenciar
+            # "tribunal travado" de "processo inteiro morto").
+            status_bots.atualizar_status(nome, NOME_DO_GRUPO, "rodando")
 
             if indice_valor == 0 and indice_classe == 0:
                 preencheu = preencher_pesquisa_generica(pagina, tipo_pesquisa, valor_busca_atual, classe_atual)
@@ -1737,11 +1750,11 @@ with sync_playwright() as p:
     print("Tribunais:", ", ".join(t["nome"] for t in EPROC_TRIBUNAIS))
     print(f"Valor mínimo da causa para salvar: {formatar_moeda_br(VALOR_MINIMO_CAUSA)}")
 
-    # Loop contínuo — o GitHub Actions corta a execução sozinho no
-    # timeout-minutes do workflow (não tem checagem de horário aqui,
-    # já que é um repositório novo, sem o painel de status/heartbeat
-    # dos outros bots). Se quiser isso depois, é só pedir.
-    while True:
+    status_bots.iniciar_heartbeat(NOME_DO_GRUPO)
+
+    IGNORAR_HORARIO = os.getenv("IGNORAR_HORARIO", "").lower() == "true"
+
+    while IGNORAR_HORARIO or status_bots.horario_permitido():
         print()
         print("##########################################")
         print(" NOVA VARREDURA — TJSP")
@@ -1750,16 +1763,34 @@ with sync_playwright() as p:
         try:
             for tribunal in EPROC_TRIBUNAIS:
                 nome_tribunal = tribunal["nome"]
+
+                if not IGNORAR_HORARIO and not status_bots.horario_permitido():
+                    print(f"Passou do horário permitido — parando a varredura em {nome_tribunal}.")
+                    break
+
+                if status_bots.esta_pausado_manualmente(nome_tribunal):
+                    print(f"{nome_tribunal} está pausado manualmente — pulando.")
+                    status_bots.atualizar_status(nome_tribunal, NOME_DO_GRUPO, "pausado")
+                    continue
+
                 print()
                 print(f"--- {nome_tribunal} (eproc) ---")
                 try:
                     sucesso, detalhe_erro = processar_eproc_tribunal(sessao_eproc, tribunal)
                     if sucesso:
+                        status_bots.atualizar_status(nome_tribunal, NOME_DO_GRUPO, "rodando")
                         print(f"[{nome_tribunal}] Ciclo concluído com sucesso.")
                     else:
+                        status_bots.atualizar_status(
+                            nome_tribunal, NOME_DO_GRUPO, "erro", detalhe_erro=detalhe_erro
+                        )
                         print(f"[{nome_tribunal}] Ciclo terminou com erro: {detalhe_erro}")
                 except Exception as erro:
                     print(f"ERRO ao processar {nome_tribunal} (eproc):", type(erro).__name__, erro)
+                    status_bots.atualizar_status(
+                        nome_tribunal, NOME_DO_GRUPO, "erro",
+                        detalhe_erro=f"{type(erro).__name__}: {erro}",
+                    )
 
             print()
             print(f"Aguardando {INTERVALO_ENTRE_VARREDURAS}s antes da próxima varredura...")
@@ -1774,5 +1805,10 @@ with sync_playwright() as p:
             print()
             print("ERRO GERAL NO LOOP PRINCIPAL:", type(erro).__name__, erro)
             time.sleep(INTERVALO_ENTRE_VARREDURAS)
+
+    print()
+    print("Fora do horário permitido — encerrando a execução.")
+    for tribunal in EPROC_TRIBUNAIS:
+        status_bots.atualizar_status(tribunal["nome"], NOME_DO_GRUPO, "fora_do_horario")
 
     sessao_eproc.fechar()
