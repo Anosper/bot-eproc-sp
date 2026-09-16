@@ -50,11 +50,22 @@ def tecla_pular_pressionada():
         return False
 
 
+# Sinalizador global: fica True quando o alerta de captcha aparece,
+# pra qualquer parte do código poder checar e desistir da pesquisa
+# atual em vez de esperar um resultado que nunca vai carregar.
+captcha_detectado = False
+
+
 def tratar_dialogo(dialog):
+    global captcha_detectado
     print()
     print("--- ALERTA DA PÁGINA ---")
     print(dialog.message)
     print("------------------------")
+    mensagem_lower = dialog.message.strip().lower()
+    if "captcha" in mensagem_lower:
+        captcha_detectado = True
+        print("(Detectado: alerta de CAPTCHA — vou pular esta pesquisa e dar uma pausa maior.)")
     try:
         dialog.accept()
         print("OK clicado automaticamente.")
@@ -111,6 +122,14 @@ HEADLESS = False
 
 ARQUIVO_SESSAO_EPROC = "sessao_eproc_sp.json"
 INTERVALO_ENTRE_VARREDURAS = 30
+
+# Pausa extra (em segundos) depois de um alerta de CAPTCHA — o TJSP
+# parece disparar isso quando as pesquisas acontecem rápido demais em
+# sequência. Não tem como "resolver" um captcha de imagem via código;
+# só dá pra tentar recarregar a página (o token/sessão do captcha
+# pode ser o problema, não a imagem em si) ou reduzir a frequência.
+PAUSA_APOS_CAPTCHA = 120
+MAX_TENTATIVAS_CAPTCHA_RECARGA = 2
 VALOR_MINIMO_CAUSA = float(os.getenv("VALOR_MINIMO_CAUSA_EPROC", "10000"))
 
 NOME_DO_GRUPO = "eprocsp"
@@ -1584,6 +1603,7 @@ def fazer_login_eproc(sessao, tribunal):
 # ============================================================
 def processar_eproc_tribunal(sessao, tribunal):
     """Retorna (sucesso: bool, detalhe_erro: str|None)."""
+    global captcha_detectado
     nome = tribunal["nome"]
 
     if not fazer_login_eproc(sessao, tribunal):
@@ -1651,10 +1671,17 @@ def processar_eproc_tribunal(sessao, tribunal):
                 if not sucesso_filtro:
                     continue
 
-            clicou = clicar_consultar(pagina)
-            processos_encontrados = None
-            ja_e_processo = False
-            if clicou:
+            pesquisa_ok = False
+            tentativas_captcha = 0
+            while True:
+                pagina.wait_for_timeout(5000)  # pequena pausa antes de consultar, pra não bater rápido demais
+                clicou = clicar_consultar(pagina)
+                processos_encontrados = None
+                ja_e_processo = False
+
+                if not clicou:
+                    break
+
                 try:
                     pagina.wait_for_load_state("domcontentloaded", timeout=30000)
                 except Exception:
@@ -1662,14 +1689,40 @@ def processar_eproc_tribunal(sessao, tribunal):
                 pagina.wait_for_timeout(2000)
                 verificar_e_aguardar_cloudflare(pagina)
 
-                if pagina_parece_ser_processo(pagina):
-                    print(f"[{nome}] Consulta redirecionou direto para um processo (resultado único).")
-                    ja_e_processo = True
-                else:
-                    processos_encontrados = garantir_resultados_ano_atual(pagina, timeout_geral=timeout_resultados)
+                if captcha_detectado:
+                    captcha_detectado = False
+                    tentativas_captcha += 1
+                    print(f"[{nome}] Captcha detectado (tentativa {tentativas_captcha}/{MAX_TENTATIVAS_CAPTCHA_RECARGA}).")
+
+                    if tentativas_captcha > MAX_TENTATIVAS_CAPTCHA_RECARGA:
+                        print(
+                            f"[{nome}] Captcha persistente mesmo depois de recarregar "
+                            f"{MAX_TENTATIVAS_CAPTCHA_RECARGA}x — desistindo desta pesquisa. "
+                            f"Pausa extra de {PAUSA_APOS_CAPTCHA}s..."
+                        )
+                        pagina.wait_for_timeout(PAUSA_APOS_CAPTCHA * 1000)
+                        break
+
+                    print(f"[{nome}] Recarregando a página e refazendo a pesquisa...")
+                    if not recarregar_e_refazer_pesquisa(pagina, tipo_pesquisa, valor_busca_atual, classe_atual, nome):
+                        print(f"[{nome}] Não consegui refazer a pesquisa depois do captcha — desistindo desta combinação.")
+                        break
+                    continue  # tenta consultar de novo com a página recarregada
+
+                pesquisa_ok = True
+                break
+
+            if not pesquisa_ok:
+                continue
+
+            if pagina_parece_ser_processo(pagina):
+                print(f"[{nome}] Consulta redirecionou direto para um processo (resultado único).")
+                ja_e_processo = True
+            else:
+                processos_encontrados = garantir_resultados_ano_atual(pagina, timeout_geral=timeout_resultados)
 
             if ja_e_processo:
-                numero_processo, e_ano_atual = checar_ano_do_processo(pagina, f"{nome}_{cnpj_atual}_{classe_atual}")
+                numero_processo, e_ano_atual = checar_ano_do_processo(pagina, f"{nome}_{valor_busca_atual}_{classe_atual}")
                 if not e_ano_atual:
                     print(f"[{nome}] Processo redirecionado não é do ano atual — pulando por segurança.")
                     pagina = fechar_processo_e_voltar(pagina, pagina)
