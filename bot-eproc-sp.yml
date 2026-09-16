@@ -1,0 +1,52 @@
+name: Bot eproc TJSP - captação de processos
+
+on:
+  schedule:
+    # Expediente de 9h (8h-17h Brasília), 2 disparos por dia.
+    - cron: '0 11 * * 1-5'   # 08:00 em Brasília
+    - cron: '0 17 * * 1-5'   # 14:00 em Brasília
+  workflow_dispatch: {}
+
+jobs:
+  captar-processos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Baixar o código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar Xvfb (tela virtual) e dependências do navegador
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Escrever credencial do Firebase
+        env:
+          FIREBASE_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_EPROC_JSON }}
+        run: |
+          echo "$FIREBASE_JSON" > firebase-service-account-eproc.json
+
+      - name: Rodar o bot dentro do Xvfb (loop contínuo até o timeout do job)
+        env:
+          EPROC_SP_USUARIO: ${{ secrets.EPROC_SP_USUARIO }}
+          EPROC_SP_SENHA: ${{ secrets.EPROC_SP_SENHA }}
+          EPROC_SP_TOTP_SECRET: ${{ secrets.EPROC_SP_TOTP_SECRET }}
+          PYTHONUNBUFFERED: "1"
+        run: xvfb-run -a python bot_eproc_sp.py
+
+      - name: Publicar screenshots de diagnóstico (se algo falhou)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-eproc-sp
+          path: debug_eproc_sp/
+          if-no-files-found: ignore
+          retention-days: 5
