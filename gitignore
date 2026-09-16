@@ -1,0 +1,6 @@
+.env
+firebase-service-account*.json
+sessao_eproc_sp.json
+debug_eproc_sp/
+__pycache__/
+*.pyc
