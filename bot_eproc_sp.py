@@ -8,10 +8,6 @@ from datetime import datetime, timedelta
 import pyotp
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
-import firebase_admin
-from firebase_admin import credentials
-from firebase_admin import firestore
-
 import status_bots
 
 
@@ -304,19 +300,30 @@ def verificar_e_aguardar_cloudflare(pagina, timeout_segundos=60):
 
 
 # ============================================================
-# FIREBASE
+# FIREBASE (com failover entre projetos + cache local anti-duplicidade)
 # ============================================================
-NOME_ARQUIVO_FIREBASE = "firebase-service-account-eproc.json"
+from google.api_core.exceptions import ResourceExhausted
 
 print()
 print("==========================================")
-print(" CONECTANDO AO FIREBASE")
+print(" CONECTANDO AO FIREBASE (com failover)")
 print("==========================================")
 try:
-    credencial = credentials.Certificate(NOME_ARQUIVO_FIREBASE)
-    firebase_admin.initialize_app(credencial)
-    db = firestore.client()
-    print("Firebase conectado com sucesso!")
+    from firebase_manager import FirebaseManager
+    from ultimo_visto import UltimoVisto
+
+    fm = FirebaseManager([
+        # "principal" AQUI é o projeto próprio do eproc (não o
+        # principal do PJe) — os 3 failovers são reaproveitados do
+        # PJe (mesmos projetos/credenciais).
+        {"name": "principal", "cred_path": "firebase-service-account-eproc.json"},
+        {"name": "failover", "cred_path": "firebase-service-account-failover.json"},
+        {"name": "failover2", "cred_path": "firebase-service-account-failover2.json"},
+        {"name": "failover3", "cred_path": "firebase-service-account-failover3.json"},
+    ])
+    uv = UltimoVisto()
+    db = fm.client()
+    print(f"Firebase conectado com sucesso! (projeto ativo: {fm.active_project})")
 except Exception as erro:
     print()
     print("==========================================")
@@ -327,19 +334,39 @@ except Exception as erro:
     raise
 
 
-def processo_existe_no_firebase(numero):
+def processo_existe_no_firebase(numero, chave_uv):
+    """
+    `chave_uv` identifica de forma única a combinação de busca atual
+    (ex: "TJSP||OAB||SP114904||Execução de Título Extrajudicial") —
+    serve pro cache local (UltimoVisto) saber que já viu esse mesmo
+    resultado antes, sem precisar nem consultar o Firestore.
+    """
     if not numero:
         return False
-    try:
-        documento = db.collection("processos").document(numero).get()
-        if documento.exists:
-            print(f"[JÁ EXISTE] {numero}")
-            return True
-        print(f"[NOVO] {numero}")
-        return False
-    except Exception as erro:
-        print("ERRO AO CONSULTAR FIREBASE:", type(erro).__name__, erro)
+
+    if not uv.eh_novo(chave_uv, numero):
+        print(f"[JÁ EXISTE - cache local] {numero}")
         return True
+
+    global db
+    for tentativa in range(2):  # tenta no projeto atual e, se estourar, 1x no próximo
+        try:
+            documento_ref = db.collection("processos").document(numero)
+            documento = fm.get(documento_ref)
+            if documento.exists:
+                print(f"[JÁ EXISTE] {numero}")
+                return True
+            print(f"[NOVO] {numero}")
+            return False
+        except ResourceExhausted:
+            print(f"Cota estourada em '{fm.active_project}'. Trocando de projeto...")
+            db = fm.client()
+        except Exception as erro:
+            print("ERRO AO CONSULTAR FIREBASE:", type(erro).__name__, erro)
+            return True
+
+    print("Nenhum projeto Firebase disponível no momento.")
+    return True
 
 
 def valor_causa_para_float(valor_causa_texto):
@@ -359,7 +386,7 @@ def formatar_moeda_br(valor):
     return f"R$ {texto}"
 
 
-def salvar_processo_no_firebase(dados, tribunal_origem):
+def salvar_processo_no_firebase(dados, tribunal_origem, chave_uv):
     numero = dados.get("numero")
     if not numero:
         print()
@@ -371,24 +398,34 @@ def salvar_processo_no_firebase(dados, tribunal_origem):
     dados["emProcessos"] = True
     dados["data_distribuicao"] = dados["dataCaptacao"]
 
-    try:
-        db.collection("processos").document(numero).set(dados)
-        print()
-        print("==========================================")
-        print(" PROCESSO SALVO NO FIREBASE")
-        print("==========================================")
-        print("Número:", dados.get("numero"))
-        print("Réu:", dados.get("reu"))
-        print("CPF/CNPJ:", dados.get("documento_reu"))
-        print("Classe:", dados.get("classe"))
-        print("Tribunal:", tribunal_origem)
-        print("Autor:", dados.get("autor"))
-        print("Valor:", dados.get("valor_causa"))
-        return True
-    except Exception as erro:
-        print()
-        print("ERRO AO SALVAR NO FIREBASE:", type(erro).__name__, erro)
-        return False
+    global db
+    for tentativa in range(2):
+        try:
+            documento_ref = db.collection("processos").document(numero)
+            fm.set(documento_ref, dados)
+            uv.atualizar(chave_uv, numero)
+            print()
+            print("==========================================")
+            print(" PROCESSO SALVO NO FIREBASE")
+            print("==========================================")
+            print("Número:", dados.get("numero"))
+            print("Réu:", dados.get("reu"))
+            print("CPF/CNPJ:", dados.get("documento_reu"))
+            print("Classe:", dados.get("classe"))
+            print("Tribunal:", tribunal_origem)
+            print("Autor:", dados.get("autor"))
+            print("Valor:", dados.get("valor_causa"))
+            return True
+        except ResourceExhausted:
+            print(f"Cota estourada em '{fm.active_project}'. Trocando de projeto...")
+            db = fm.client()
+        except Exception as erro:
+            print()
+            print("ERRO AO SALVAR NO FIREBASE:", type(erro).__name__, erro)
+            return False
+
+    print("Nenhum projeto Firebase disponível no momento para gravar.")
+    return False
 
 
 def diagnosticar_tela(pagina, rotulo):
@@ -1639,6 +1676,7 @@ def processar_eproc_tribunal(sessao, tribunal):
         for indice_classe, classe_atual in enumerate(tribunal["classes"]):
             print()
             print(f"--- {nome} / {tipo_pesquisa} {valor_busca_atual} / {classe_atual} ---")
+            chave_uv = f"{nome}||{tipo_pesquisa}||{valor_busca_atual}||{classe_atual}"
             # Reafirma "rodando" a cada combinação — se travar numa
             # específica, o "atualizadoEm" para de avançar mesmo com
             # o heartbeat do grupo continuando (ajuda a diferenciar
@@ -1728,7 +1766,7 @@ def processar_eproc_tribunal(sessao, tribunal):
                     pagina = fechar_processo_e_voltar(pagina, pagina)
                     sessao.pagina = pagina
                     continue
-                if processo_existe_no_firebase(numero_processo):
+                if processo_existe_no_firebase(numero_processo, chave_uv):
                     pagina = fechar_processo_e_voltar(pagina, pagina)
                     sessao.pagina = pagina
                     continue
@@ -1743,7 +1781,7 @@ def processar_eproc_tribunal(sessao, tribunal):
                 if not numero_processo or ano_atual not in numero_processo:
                     print(f"[{nome}] Não confirmei que o primeiro processo é de {ano_atual} — pulando por segurança.")
                     continue
-                if processo_existe_no_firebase(numero_processo):
+                if processo_existe_no_firebase(numero_processo, chave_uv):
                     continue
                 processo_pagina = abrir_primeiro_processo(pagina, contexto, processos_override=processos_encontrados)
                 if processo_pagina is None:
@@ -1777,7 +1815,7 @@ def processar_eproc_tribunal(sessao, tribunal):
             if not dados.get("numero"):
                 print(f"[{nome}] ERRO: não identifiquei o número do processo — não será salvo.")
             else:
-                salvar_processo_no_firebase(dados, nome)
+                salvar_processo_no_firebase(dados, nome, chave_uv)
 
             pagina = fechar_processo_e_voltar(pagina, processo_pagina)
             sessao.pagina = pagina
