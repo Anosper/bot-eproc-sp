@@ -132,7 +132,7 @@ PAUSA_APOS_CAPTCHA = 120
 MAX_TENTATIVAS_CAPTCHA_RECARGA = 2
 VALOR_MINIMO_CAUSA = float(os.getenv("VALOR_MINIMO_CAUSA_EPROC", "10000"))
 
-NOME_DO_GRUPO = "eprocsp"
+NOME_DO_GRUPO = "eproc"
 
 CLASSES_EPROC_PADRAO = [
     "Execução de Título Extrajudicial",
