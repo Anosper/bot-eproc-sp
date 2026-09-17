@@ -2,5 +2,9 @@
 firebase-service-account*.json
 sessao_eproc_sp.json
 debug_eproc_sp/
+firebase_quota_state.json
+firebase_quota_state.json.lock
+ultimo_visto.json
+ultimo_visto.json.lock
 __pycache__/
 *.pyc
