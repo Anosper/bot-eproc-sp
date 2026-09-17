@@ -2,7 +2,7 @@ name: Bot eproc TJSP - captação de processos
 
 on:
   schedule:
-    # Expediente de 9h (8h-17h Brasília), 2 disparos por dia.
+    # Expediente de 10h (8h-18h Brasília), 2 disparos por dia.
     - cron: '0 11 * * 1-5'   # 08:00 em Brasília
     - cron: '0 17 * * 1-5'   # 14:00 em Brasília
   workflow_dispatch:
@@ -33,17 +33,21 @@ jobs:
           pip install -r requirements.txt
           playwright install --with-deps chromium
 
-      - name: Escrever credencial do Firebase (projeto de processos)
+      - name: Escrever credencial do Firebase (principal do eproc)
         env:
           FIREBASE_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_EPROC_JSON }}
         run: |
           echo "$FIREBASE_JSON" > firebase-service-account-eproc.json
 
-      - name: Escrever credencial do Firebase (projeto botorion2 — status/heartbeat)
+      - name: Escrever credenciais do Firebase (failovers — mesmos do bot PJe)
         env:
-          BOTORION2_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_BOTORION2_JSON }}
+          FAILOVER_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_FAILOVER_JSON }}
+          FAILOVER2_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_FAILOVER2_JSON }}
+          FAILOVER3_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_FAILOVER3_JSON }}
         run: |
-          echo "$BOTORION2_JSON" > firebase-service-account2.json
+          echo "$FAILOVER_JSON" > firebase-service-account-failover.json
+          echo "$FAILOVER2_JSON" > firebase-service-account-failover2.json
+          echo "$FAILOVER3_JSON" > firebase-service-account-failover3.json
 
       - name: Rodar o bot dentro do Xvfb (loop contínuo até 17h ou o timeout do job)
         env:
@@ -51,6 +55,12 @@ jobs:
           EPROC_SP_SENHA: ${{ secrets.EPROC_SP_SENHA }}
           EPROC_SP_TOTP_SECRET: ${{ secrets.EPROC_SP_TOTP_SECRET }}
           IGNORAR_HORARIO: ${{ github.event.inputs.ignorar_horario }}
+          # status_bots.py usa esse mesmo arquivo de credencial (em
+          # vez de um segundo projeto/secret separado — mais simples,
+          # mas isso significa que o status/heartbeat fica salvo no
+          # MESMO projeto Firebase dos "processos", não num projeto
+          # "botorion2" separado.
+          BOTORION2_CREDENCIAL_PATH: firebase-service-account-eproc.json
           PYTHONUNBUFFERED: "1"
         run: xvfb-run -a python bot_eproc_sp.py
 
